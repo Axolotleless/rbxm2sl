@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>rbxm2SL</title>
+</head>
+<body>
+
+<h1>rbxm2SL</h1>
+<p>Decode .rbxm / .rbxmx / .rbxl / .rbxlx files into a runnable Lua script. Handles Parts, MeshParts, GUIs, Lighting, Scripts, everything.</p>
+
+<input type="file" id="fileInput" accept=".rbxm,.rbxmx,.rbxl,.rbxlx">
+<br><br>
+
+<div id="status">Ready.</div>
+<br>
+
+<div id="statsBar" style="display:none">
+  Instances: <b id="statInst">0</b> &nbsp;|&nbsp;
+  Classes: <b id="statCls">0</b> &nbsp;|&nbsp;
+  Scripts: <b id="statScripts">0</b>
+</div>
+
+<br>
+
+<div id="mainArea" style="display:none">
+  <table border="0" width="100%" cellpadding="4">
+    <tr valign="top">
+      <td width="300" style="border-right:1px solid #ccc">
+        <b>Instance Tree</b><br>
+        <div id="treeContainer" style="overflow-y:auto;height:520px;font-family:monospace;font-size:12px;border:1px solid #ccc;padding:2px;"></div>
+      </td>
+      <td>
+        <b>Properties</b><br>
+        <div id="propsContainer" style="overflow-y:auto;height:520px;font-family:monospace;font-size:12px;border:1px solid #ccc;padding:4px;">
+          Click an instance in the tree.
+        </div>
+      </td>
+    </tr>
+  </table>
+</div>
+
+<br>
+
+<div id="outputSection" style="display:none">
+  <b>Output type:</b>
+  <button onclick="setMode('local')">LocalScript</button>
+  <button onclick="setMode('module')">ModuleScript</button>
+  <button onclick="setMode('server')">Script (Server)</button>
+  &nbsp;&nbsp;
+  <button onclick="copyOut()">Copy</button>
+  <button onclick="downloadOut()">Save .lua</button>
+  <br><br>
+  <textarea id="outputArea" rows="30" cols="120" readonly style="font-family:monospace;font-size:12px;"></textarea>
+</div>
+
+<script>
+// ─── globals ────────────────────────────────────────────────────────────────
+var INST_MAP  = {};   // refId (number) -> inst object
+var INST_LIST = [];
+var CLASS_MAP = {};   // classId (number) -> { name, refs[] }
+var OUT_MODE  = 'local';
+var FILE_NAME = 'output';
+
+// ─── file input ─────────────────────────────────────────────────────────────
+document.getElementById('fileInput').addEventListener('change', function() {
+  var f = this.files[0];
+  if (!f) return;
+  FILE_NAME = f.name.replace(/\.[^.]+$/,'');
+  setStatus('Reading ' + f.name + ' (' + fmtSize(f.size) + ')...');
+  var r = new FileReader();
+  r.onload = function(e) {
+    var bytes = new Uint8Array(e.target.result);
+    try {
+      if (isXML(bytes)) {
+        setStatus('XML format. Parsing...');
+        parseXML(new TextDecoder('utf-8',{fatal:false}).decode(bytes));
+      } else if (bytes[0]===0x3c && bytes[1]===0x72 && bytes[7]===0x21) {
+        setStatus('Binary format. Parsing...');
+        parseBinary(bytes);
+      } else {
+        setStatus('ERROR: Not a recognised Roblox file.');
+      }
+    } catch(ex) {
+      setStatus('ERROR: ' + ex.message);
+      console.error(ex);
+    }
+  };
+  r.readAsArrayBuffer(f);
+});
+
+function isXML(b) {
+  // UTF-8 BOM or starts with '<'
+  if (b[0]===0xEF && b[1]===0xBB && b[2]===0xBF) return b[3]===0x3c;
+  return b[0]===0x3c && b[7]!==0x21; // '<' but NOT binary magic second half
+}
+
+function setStatus(s) { document.getElementById('status').textContent = s; }
+function fmtSize(n) {
+  if (n<1024) return n+' B';
+  if (n<1048576) return (n/1024).toFixed(1)+' KB';
+  return (n/1048576).toFixed(1)+' MB';
+}
+
+// ─── LZ4 block decompressor ─────────────────────────────────────────────────
+function lz4dec(src, dstSize) {
+  var dst = new Uint8Array(dstSize);
+  var s=0, d=0;
+  while (s < src.length) {
+    var tok = src[s++];
+    var ll = (tok>>4)&0xf;
+    if (ll===15) { var x; do { x=src[s++]; ll+=x; } while(x===255); }
+    for (var i=0;i<ll;i++) dst[d++]=src[s++];
+    if (s>=src.length) break;
+    var off = src[s]|(src[s+1]<<8); s+=2;
+    var ml = (tok&0xf)+4;
+    if (ml-4===15) { var x; do { x=src[s++]; ml+=x; } while(x===255); }
+    var cp = d-off;
+    for (var i=0;i<ml;i++) { dst[d]=dst[cp]; d++; cp++; }
+  }
+  return dst.subarray(0,d);
+}
+
+// ─── ZSTD minimal decoder (raw/RLE blocks + literal pass-through) ────────────
+function zstdDec(src, dstSize) {
+  var p=0;
+  // frame magic
+  var mag = (src[p]|(src[p+1]<<8)|(src[p+2]<<16)|((src[p+3]&0xff)*0x1000000))>>>0;
+  p+=4;
+  if (mag !== 0xFD2FB528) throw new Error('Not zstd frame');
+  var fhd=src[p++];
+  var fcsFlag=(fhd>>6)&3, singleSeg=(fhd>>5)&1, didFlag=fhd&3;
+  if (!singleSeg) p++; // window descriptor
+  p += [0,1,2,4][didFlag]; // dict id
+  // frame content size
+  if (fcsFlag===0){ if(singleSeg) p++; }
+  else if(fcsFlag===1) p+=2;
+  else if(fcsFlag===2) p+=4;
+  else p+=8;
+
+  var dst = new Uint8Array(dstSize||4194304);
+  var dPos=0;
+  while(true) {
+    var bh0=src[p],bh1=src[p+1],bh2=src[p+2]; p+=3;
+    var last=bh0&1, bType=(bh0>>1)&3;
+    var bSize=(bh0>>3)|(bh1<<5)|(bh2<<13);
+    if (bType===0) { // raw block
+      for(var i=0;i<bSize;i++) dst[dPos++]=src[p+i]; p+=bSize;
+    } else if (bType===1) { // RLE
+      var b=src[p++]; for(var i=0;i<bSize;i++) dst[dPos++]=b;
+    } else if (bType===2) { // compressed
+      var bEnd=p+bSize;
+      var lits=zstdLits(src,p,bEnd); p=lits.np;
+      var ld=lits.data;
+      for(var i=0;i<ld.length;i++) dst[dPos++]=ld[i];
+      p=bEnd;
+    } else throw new Error('Reserved zstd block');
+    if(last) break;
+  }
+  return dst.subarray(0,dPos);
+}
+
+function zstdLits(src, p, bEnd) {
+  var litType=src[p]&3, lss=(src[p]>>2)&3;
+  if (litType===0||litType===2) { // raw or RLE
+    var sz;
+    if(lss===0||lss===2){sz=src[p]>>3;p++;}
+    else if(lss===1){sz=(src[p]>>4)|(src[p+1]<<4);p+=2;}
+    else{sz=(src[p]>>4)|(src[p+1]<<4)|(src[p+2]<<12);p+=3;}
+    if(litType===0){ return {data:src.subarray(p,p+sz), np:p+sz}; }
+    else{ var d=new Uint8Array(sz); d.fill(src[p]); return {data:d, np:p+1}; }
+  } else { // Huffman/treeless — treat compressed literals as raw
+    var sz, cz;
+    if(lss===0){sz=(src[p]>>4)|((src[p+1]&0x3f)<<4);cz=(src[p+1]>>6)|(src[p+2]<<2);p+=3;}
+    else if(lss===1){sz=(src[p]>>4)|(src[p+1]<<4);cz=src[p+2];p+=3;}
+    else{sz=(src[p]>>4)|(src[p+1]<<4)|((src[p+2]&3)<<12);cz=(src[p+2]>>2)|(src[p+3]<<6);p+=4;}
+    var jump=(litType===3)?sz:cz;
+    return {data:src.subarray(p,p+Math.min(sz,bEnd-p)), np:p+jump};
+  }
+}
+
+function decompress(raw, decompLen) {
+  if (!raw.length || raw.length===decompLen) return raw;
+  var mag=(raw[0]|(raw[1]<<8)|(raw[2]<<16)|((raw[3]&0xff)*0x1000000))>>>0;
+  if (mag===0xFD2FB528) return zstdDec(raw, decompLen);
+  return lz4dec(raw, decompLen);
+}
+
+// ─── Read helpers ────────────────────────────────────────────────────────────
+function ru32(b,p){ return (b[p]|(b[p+1]<<8)|(b[p+2]<<16)|((b[p+3]&0xff)*0x1000000))>>>0; }
+function ri32(b,p){ var v=ru32(b,p); return v>0x7fffffff?v-0x100000000:v; }
+function rf32(b,p){
+  var dv=new DataView(new ArrayBuffer(4));
+  dv.setUint8(0,b[p]);dv.setUint8(1,b[p+1]);dv.setUint8(2,b[p+2]);dv.setUint8(3,b[p+3]);
+  return dv.getFloat32(0,true);
+}
+function rf32be(b,p){ // big-endian float for interleaved
+  var dv=new DataView(new ArrayBuffer(4));
+  dv.setUint8(0,b[p]);dv.setUint8(1,b[p+1]);dv.setUint8(2,b[p+2]);dv.setUint8(3,b[p+3]);
+  return dv.getFloat32(0,false);
+}
+function rf64(b,p){
+  var dv=new DataView(new ArrayBuffer(8));
+  for(var i=0;i<8;i++) dv.setUint8(i,b[p+i]);
+  return dv.getFloat64(0,true);
+}
+function rStr(b,p){
+  var len=ru32(b,p);
+  return {val:new TextDecoder('utf-8',{fatal:false}).decode(b.subarray(p+4,p+4+len)), end:p+4+len};
+}
+
+// ─── Interleaved int decode (zigzag → signed int32) ──────────────────────────
+// Layout: b[i], b[i+count], b[i+count*2], b[i+count*3] form a big-endian uint32
+// Then zigzag: signed = (uint >> 1) ^ -(uint & 1)
+function diInt(buf, count) {
+  var out=new Array(count);
+  for(var i=0;i<count;i++){
+    var b0=i<buf.length?buf[i]:0;
+    var b1=(i+count)<buf.length?buf[i+count]:0;
+    var b2=(i+count*2)<buf.length?buf[i+count*2]:0;
+    var b3=(i+count*3)<buf.length?buf[i+count*3]:0;
+    var u=((b0<<24)|(b1<<16)|(b2<<8)|b3)>>>0;
+    // zigzag decode to signed 32-bit
+    var s=(u>>>1)^(-(u&1)>>>0);
+    // convert unsigned result to signed
+    out[i]=(s|0);
+  }
+  return out;
+}
+
+// Interleaved float: bytes interleaved big-endian, then rotate right 1 bit to get IEEE float
+function diFloat(buf, count) {
+  var dv=new DataView(new ArrayBuffer(4));
+  var out=new Array(count);
+  for(var i=0;i<count;i++){
+    var b0=i<buf.length?buf[i]:0;
+    var b1=(i+count)<buf.length?buf[i+count]:0;
+    var b2=(i+count*2)<buf.length?buf[i+count*2]:0;
+    var b3=(i+count*3)<buf.length?buf[i+count*3]:0;
+    var u=((b0<<24)|(b1<<16)|(b2<<8)|b3)>>>0;
+    // rotate right 1 bit
+    u=((u>>>1)|((u&1)<<31))>>>0;
+    dv.setUint32(0,u,false);
+    out[i]=dv.getFloat32(0,false);
+  }
+  return out;
+}
+
+// Decode a ref array: interleaved zigzag + delta cumulative sum
+function decodeRefs(buf, count) {
+  var ids=diInt(buf,count);
+  for(var i=1;i<count;i++) ids[i]+=ids[i-1];
+  return ids;
+}
+
+// ─── BINARY PARSER ───────────────────────────────────────────────────────────
+function parseBinary(bytes) {
+  INST_MAP={}; INST_LIST=[]; CLASS_MAP={};
+
+  // Roblox binary header:
+  // bytes 0-7:  magic "<roblox!"
+  // bytes 8-15: more magic "\x89\xff\r\n\x1a\n\x00\x00"
+  // bytes 16-19: num_classes (little-endian u32)
+  // bytes 20-23: num_instances (little-endian u32)
+  // bytes 24-31: reserved
+  // chunks start at byte 32
+  var pos=32;
+
+  // Collect all chunks first
+  var chunks=[];
+  while(pos<bytes.length-4) {
+    var ct=new TextDecoder().decode(bytes.subarray(pos,pos+4)).replace(/\0/g,'').trim();
+    var compLen  =ru32(bytes,pos+4);
+    var decompLen=ru32(bytes,pos+8);
+    pos+=16;
+    var raw=bytes.subarray(pos,pos+compLen); pos+=compLen;
+    var payload;
+    try{ payload=decompress(raw,decompLen); }
+    catch(e){ payload=raw; }
+    chunks.push({type:ct,payload:payload});
+    if(ct==='END') break;
+  }
+
+  // Pass 1: INST — build classId -> {name, refs[]}  AND populate INST_MAP
+  for(var ci=0;ci<chunks.length;ci++){
+    var ch=chunks[ci];
+    if(ch.type!=='INST') continue;
+    var pl=ch.payload, p=0;
+    try{
+      var classId=ru32(pl,p); p+=4;
+      var nl=ru32(pl,p); p+=4;
+      var cname=new TextDecoder('utf-8',{fatal:false}).decode(pl.subarray(p,p+nl)); p+=nl;
+      p++; // isService flag
+      var count=ru32(pl,p); p+=4;
+      var refs=decodeRefs(pl.subarray(p,p+count*4),count);
+      CLASS_MAP[classId]={name:cname,refs:refs};
+      for(var i=0;i<refs.length;i++){
+        var r=refs[i];
+        var inst={id:r,cls:cname,name:cname,props:{},parentId:-1,children:[]};
+        INST_MAP[r]=inst;
+        INST_LIST.push(inst);
+      }
+    }catch(e){ console.warn('INST parse error',e); }
+  }
+
+  // Pass 2: PROP — use CLASS_MAP to find which instances get each property
+  for(var ci=0;ci<chunks.length;ci++){
+    var ch=chunks[ci];
+    if(ch.type!=='PROP') continue;
+    var pl=ch.payload, p=0;
+    try{
+      var classId=ru32(pl,p); p+=4;
+      var nl=ru32(pl,p); p+=4;
+      var pname=new TextDecoder('utf-8',{fatal:false}).decode(pl.subarray(p,p+nl)); p+=nl;
+      var typeId=pl[p++];
+      if(!(classId in CLASS_MAP)) continue;
+      var refs=CLASS_MAP[classId].refs;
+      var insts=[]; for(var i=0;i<refs.length;i++) if(INST_MAP[refs[i]]) insts.push(INST_MAP[refs[i]]);
+      var count=insts.length;
+      if(!count) continue;
+      parseProp(pl,p,typeId,pname,insts,count);
+    }catch(e){ /* skip malformed PROP */ }
+  }
+
+  // Pass 3: PRNT — wire up parent/child relationships
+  for(var ci=0;ci<chunks.length;ci++){
+    var ch=chunks[ci];
+    if(ch.type!=='PRNT') continue;
+    var pl=ch.payload, p=1; // skip version byte
+    try{
+      var count=ru32(pl,p); p+=4;
+      var children=decodeRefs(pl.subarray(p,p+count*4),count); p+=count*4;
+      var parents =decodeRefs(pl.subarray(p,p+count*4),count);
+      for(var i=0;i<count;i++){
+        var c=children[i], par=parents[i];
+        if(INST_MAP[c]){
+          INST_MAP[c].parentId=par;
+          if(INST_MAP[par]) INST_MAP[par].children.push(c);
+        }
+      }
+    }catch(e){ console.warn('PRNT parse error',e); }
+    break; // only one PRNT chunk
+  }
+
+  finishParse();
+}
+
+function parseProp(pl, p, typeId, pname, insts, count) {
+  var i, r;
+  switch(typeId) {
+    case 0x01: // String / ProtectedString
+      for(i=0;i<count;i++){
+        r=rStr(pl,p); p=r.end;
+        insts[i].props[pname]={t:'str',v:r.val};
+        if(pname==='Name') insts[i].name=r.val;
+      }
+      break;
+    case 0x02: // Bool
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'bool',v:pl[p++]!==0};
+      break;
+    case 0x03: // Int32 interleaved zigzag
+      var vals=diInt(pl.subarray(p,p+count*4),count); p+=count*4;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'num',v:vals[i]};
+      break;
+    case 0x04: // Float interleaved (rotated IEEE)
+      var vals=diFloat(pl.subarray(p,p+count*4),count); p+=count*4;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'num',v:vals[i]};
+      break;
+    case 0x05: // Double little-endian
+      for(i=0;i<count;i++){ insts[i].props[pname]={t:'num',v:rf64(pl,p)}; p+=8; }
+      break;
+    case 0x06: // Axes
+      for(i=0;i<count;i++){
+        var v=pl[p++];
+        insts[i].props[pname]={t:'axes',v:'Axes('+(v&4?'X ':'')+((v&2)?'Y ':'')+((v&1)?'Z':'')+')'};
+      }
+      break;
+    case 0x07: // Faces
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'str',v:'Faces('+pl[p++]+')'}; // raw
+      break;
+    case 0x08: // BrickColor (interleaved int)
+      var vals=diInt(pl.subarray(p,p+count*4),count); p+=count*4;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'bc',v:vals[i]};
+      break;
+    case 0x09: // Color3 — 3 interleaved float arrays (R[], G[], B[])
+      var rs=diFloat(pl.subarray(p,          p+count*4),count);
+      var gs=diFloat(pl.subarray(p+count*4,  p+count*8),count);
+      var bs=diFloat(pl.subarray(p+count*8,  p+count*12),count);
+      p+=count*12;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'col3',v:{r:rs[i],g:gs[i],b:bs[i]}};
+      break;
+    case 0x0A: // Vector2
+      var xs=diFloat(pl.subarray(p,         p+count*4),count);
+      var ys=diFloat(pl.subarray(p+count*4, p+count*8),count);
+      p+=count*8;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'v2',v:{x:xs[i],y:ys[i]}};
+      break;
+    case 0x0B: // Vector3
+      var xs=diFloat(pl.subarray(p,          p+count*4),count);
+      var ys=diFloat(pl.subarray(p+count*4,  p+count*8),count);
+      var zs=diFloat(pl.subarray(p+count*8,  p+count*12),count);
+      p+=count*12;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'v3',v:{x:xs[i],y:ys[i],z:zs[i]}};
+      break;
+    case 0x0C: // Vector2int16
+      for(i=0;i<count;i++){
+        var x=(pl[p]|(pl[p+1]<<8))<<16>>16, y=(pl[p+2]|(pl[p+3]<<8))<<16>>16; p+=4;
+        insts[i].props[pname]={t:'v2',v:{x:x,y:y}};
+      }
+      break;
+    case 0x0D: // CFrame
+      // Each entry: 1-byte rotID. If rotID==0: 9 floats rotation matrix. Then 3 floats position.
+      for(i=0;i<count;i++){
+        var rotId=pl[p++];
+        if(rotId===0) p+=36; // skip 9*4 rotation matrix bytes
+        var x=rf32(pl,p),y=rf32(pl,p+4),z=rf32(pl,p+8); p+=12;
+        insts[i].props[pname]={t:'cf',v:{x:x,y:y,z:z}};
+      }
+      break;
+    case 0x0E: // Enum — 4 bytes big-endian interleaved (not zigzag, just interleaved raw)
+      var raw=pl.subarray(p,p+count*4); p+=count*4;
+      for(i=0;i<count;i++){
+        var v=(raw[i]<<24)|(raw[i+count]<<16)|(raw[i+count*2]<<8)|raw[i+count*3];
+        insts[i].props[pname]={t:'enum',v:v>>>0};
+      }
+      break;
+    case 0x0F: // Referent (instance ref)
+      var refs=decodeRefs(pl.subarray(p,p+count*4),count); p+=count*4;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'ref',v:refs[i]};
+      break;
+    case 0x10: // Vector3int16
+      for(i=0;i<count;i++){
+        var x=(pl[p]|(pl[p+1]<<8))<<16>>16;
+        var y=(pl[p+2]|(pl[p+3]<<8))<<16>>16;
+        var z=(pl[p+4]|(pl[p+5]<<8))<<16>>16;
+        p+=6;
+        insts[i].props[pname]={t:'v3',v:{x:x,y:y,z:z}};
+      }
+      break;
+    case 0x11: // NumberSequence
+      for(i=0;i<count;i++){
+        var n=ru32(pl,p); p+=4; var kps=[];
+        for(var k=0;k<n;k++){ var t=rf32(pl,p),v=rf32(pl,p+4); p+=12; kps.push('('+fn(t)+', '+fn(v)+')'); }
+        insts[i].props[pname]={t:'seq',v:'NumberSequence{'+kps.join(', ')+'}'};
+      }
+      break;
+    case 0x12: // ColorSequence
+      for(i=0;i<count;i++){
+        var n=ru32(pl,p); p+=4; var kps=[];
+        for(var k=0;k<n;k++){
+          var t=rf32(pl,p),r2=rf32(pl,p+4),g2=rf32(pl,p+8),b2=rf32(pl,p+12); p+=16;
+          kps.push('('+fn(t)+', RGB('+Math.round(r2*255)+','+Math.round(g2*255)+','+Math.round(b2*255)+'))');
+        }
+        insts[i].props[pname]={t:'seq',v:'ColorSequence{'+kps.join(', ')+'}'};
+      }
+      break;
+    case 0x13: // Color3uint8 — 3 sequential bytes per instance (R, G, B)
+      for(i=0;i<count;i++){
+        insts[i].props[pname]={t:'col3',v:{r:pl[p]/255,g:pl[p+1]/255,b:pl[p+2]/255}};
+        p+=3;
+      }
+      break;
+    case 0x14: // Int64 interleaved zigzag (we read as number, losing precision above 2^53)
+      // Int64 is 8 bytes per value, interleaved in 8 groups of count
+      for(i=0;i<count;i++){
+        // Just read the low 32 bits after de-interleaving for display
+        var b0=pl[i], b1=pl[i+count], b2=pl[i+count*2], b3=pl[i+count*3];
+        var u=((b0<<24)|(b1<<16)|(b2<<8)|b3)>>>0;
+        var s=(u>>>1)^(-(u&1)>>>0); s=s|0;
+        insts[i].props[pname]={t:'num',v:s};
+      }
+      p+=count*8;
+      break;
+    case 0x15: // SharedString — 16-byte hash
+      for(i=0;i<count;i++){
+        var h=Array.from(pl.subarray(p,p+16)).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+        insts[i].props[pname]={t:'str',v:'[SharedString:'+h.substring(0,8)+'...]'};
+        p+=16;
+      }
+      break;
+    case 0x17: // UDim — interleaved float scale + interleaved int offset
+      var ss=diFloat(pl.subarray(p,         p+count*4),count);
+      var os=diInt(  pl.subarray(p+count*4, p+count*8),count);
+      p+=count*8;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'udim',v:{s:ss[i],o:os[i]}};
+      break;
+    case 0x18: // UDim2
+      var xs=diFloat(pl.subarray(p,           p+count*4),count);
+      var xo=diInt(  pl.subarray(p+count*4,   p+count*8),count);
+      var ys=diFloat(pl.subarray(p+count*8,   p+count*12),count);
+      var yo=diInt(  pl.subarray(p+count*12,  p+count*16),count);
+      p+=count*16;
+      for(i=0;i<count;i++) insts[i].props[pname]={t:'udim2',v:{xs:xs[i],xo:xo[i],ys:ys[i],yo:yo[i]}};
+      break;
+    case 0x19: // Ray
+      for(i=0;i<count;i++){
+        var ox=rf32(pl,p),oy=rf32(pl,p+4),oz=rf32(pl,p+8);
+        var dx=rf32(pl,p+12),dy=rf32(pl,p+16),dz=rf32(pl,p+20); p+=24;
+        insts[i].props[pname]={t:'ray',v:'Ray('+fn(ox)+','+fn(oy)+','+fn(oz)+' -> '+fn(dx)+','+fn(dy)+','+fn(dz)+')'};
+      }
+      break;
+    case 0x1A: // OptionalCFrame
+      for(i=0;i<count;i++){
+        var has=pl[p++];
+        if(has){ var rotId=pl[p++]; if(rotId===0)p+=36; var x=rf32(pl,p),y=rf32(pl,p+4),z=rf32(pl,p+8);p+=12; insts[i].props[pname]={t:'cf',v:{x:x,y:y,z:z}}; }
+        else { insts[i].props[pname]={t:'nil',v:'nil'}; }
+      }
+      break;
+    case 0x1B: // UniqueId (16 bytes)
+      for(i=0;i<count;i++){
+        var uid=Array.from(pl.subarray(p,p+16)).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+        insts[i].props[pname]={t:'id',v:uid}; p+=16;
+      }
+      break;
+    case 0x1C: // Font
+      for(i=0;i<count;i++){
+        r=rStr(pl,p); p=r.end;
+        var wt=ru32(pl,p); p+=4;
+        var st=pl[p++];
+        insts[i].props[pname]={t:'font',v:'"'+r.val+'" weight='+wt+' style='+st};
+      }
+      break;
+    // 0x21 (Capabilities int64), 0x1D (SharedStringV2), others: silently skip
+  }
+}
+
+// ─── XML PARSER ──────────────────────────────────────────────────────────────
+function parseXML(text) {
+  INST_MAP={}; INST_LIST=[]; CLASS_MAP={};
+  var doc=(new DOMParser()).parseFromString(text,'text/xml');
+  if(doc.querySelector('parsererror')) throw new Error('XML parse error');
+  var nextId=0;
+
+  function proc(el, parentId) {
+    var cls=el.getAttribute('class')||el.tagName;
+    var ref=el.getAttribute('referent')||('_'+(nextId++));
+    var inst={id:ref,cls:cls,name:cls,props:{},parentId:parentId,children:[]};
+    INST_MAP[ref]=inst; INST_LIST.push(inst);
+    if(INST_MAP[parentId]) INST_MAP[parentId].children.push(ref);
+
+    var pe=el.querySelector(':scope > Properties');
+    if(pe) {
+      for(var i=0;i<pe.children.length;i++) {
+        var ch=pe.children[i];
+        var pname=ch.getAttribute('name')||ch.tagName;
+        var tag=ch.tagName.toLowerCase();
+        try { xmlProp(inst, pname, tag, ch); } catch(e) {}
+      }
+    }
+    for(var i=0;i<el.children.length;i++){
+      if(el.children[i].tagName==='Item') proc(el.children[i], ref);
+    }
+  }
+
+  var items=doc.querySelectorAll('roblox > Item');
+  for(var i=0;i<items.length;i++) proc(items[i], -1);
+  finishParse();
+}
+
+function xmlProp(inst, pname, tag, ch) {
+  function qf(sel,def){ var el=ch.querySelector(sel); return el?parseFloat(el.textContent)||0:def||0; }
+  var p=inst.props;
+  if(tag==='string'||tag==='protectedstring'||tag==='binarystring'){
+    var v=ch.textContent||''; p[pname]={t:'str',v:v}; if(pname==='Name') inst.name=v;
+  } else if(tag==='content'||tag==='url'){
+    var u=ch.querySelector('url'); var v=u?u.textContent:ch.textContent||'';
+    p[pname]={t:'str',v:v}; if(pname==='Name') inst.name=v;
+  } else if(tag==='bool'){
+    p[pname]={t:'bool',v:ch.textContent.trim()==='true'};
+  } else if(tag==='int'||tag==='int64'){
+    p[pname]={t:'num',v:parseInt(ch.textContent)||0};
+  } else if(tag==='float'||tag==='double'){
+    p[pname]={t:'num',v:parseFloat(ch.textContent)||0};
+  } else if(tag==='color3'){
+    p[pname]={t:'col3',v:{r:qf('R'),g:qf('G'),b:qf('B')}};
+  } else if(tag==='color3uint8'){
+    var v=(parseInt(ch.textContent)||0)>>>0;
+    p[pname]={t:'col3',v:{r:((v>>16)&255)/255,g:((v>>8)&255)/255,b:(v&255)/255}};
+  } else if(tag==='vector3'){
+    p[pname]={t:'v3',v:{x:qf('X'),y:qf('Y'),z:qf('Z')}};
+  } else if(tag==='vector2'){
+    p[pname]={t:'v2',v:{x:qf('X'),y:qf('Y')}};
+  } else if(tag==='udim2'){
+    p[pname]={t:'udim2',v:{xs:qf('XS'),xo:qf('XO'),ys:qf('YS'),yo:qf('YO')}};
+  } else if(tag==='udim'){
+    p[pname]={t:'udim',v:{s:qf('S'),o:qf('O')}};
+  } else if(tag==='cframe'||tag==='coordinateframe'){
+    p[pname]={t:'cf',v:{x:qf('X'),y:qf('Y'),z:qf('Z')}};
+  } else if(tag==='token'){
+    p[pname]={t:'enum',v:parseInt(ch.textContent)||0};
+  } else if(tag==='ref'){
+    p[pname]={t:'ref',v:ch.textContent.trim()};
+  } else if(tag==='font'){
+    var fam=ch.querySelector('Family'); var wt=ch.querySelector('Weight');
+    p[pname]={t:'font',v:(fam?fam.textContent:'?')+' W='+(wt?wt.textContent:'?')};
+  } else if(tag==='numbersequence'||tag==='colorsequence'){
+    p[pname]={t:'seq',v:tag+'{'+ch.textContent.trim().substring(0,80)+'}'};
+  } else {
+    var tv=ch.textContent.trim();
+    if(tv) p[pname]={t:'str',v:tv.substring(0,300)};
+  }
+}
+
+// ─── After both parsers complete ─────────────────────────────────────────────
+function finishParse() {
+  var classes=new Set(); var scripts=0;
+  for(var i=0;i<INST_LIST.length;i++){
+    classes.add(INST_LIST[i].cls);
+    if(INST_LIST[i].cls==='Script'||INST_LIST[i].cls==='LocalScript'||INST_LIST[i].cls==='ModuleScript') scripts++;
+  }
+  document.getElementById('statInst').textContent=INST_LIST.length;
+  document.getElementById('statCls').textContent=classes.size;
+  document.getElementById('statScripts').textContent=scripts;
+  document.getElementById('statsBar').style.display='block';
+  document.getElementById('mainArea').style.display='block';
+  document.getElementById('outputSection').style.display='block';
+  buildTree();
+  generateOutput();
+  setStatus('Done. '+INST_LIST.length+' instances, '+classes.size+' classes, '+scripts+' scripts.');
+}
+
+// ─── TREE VIEW ────────────────────────────────────────────────────────────────
+function buildTree() {
+  var roots=INST_LIST.filter(function(i){ return !INST_MAP[i.parentId]; });
+  var container=document.getElementById('treeContainer');
+  container.innerHTML='';
+  if(!roots.length){ container.textContent='(no instances)'; return; }
+
+  function makeNode(inst, depth) {
+    var wrap=document.createElement('div');
+    var row=document.createElement('div');
+    row.style.paddingLeft=(depth*14+4)+'px';
+    row.style.cursor='pointer';
+    row.style.whiteSpace='nowrap';
+    row.style.paddingTop='1px';
+    row.style.paddingBottom='1px';
+    var hasKids=inst.children.length>0;
+    row.textContent=(hasKids?'[+] ':'    ')+inst.name+' ('+inst.cls+')';
+
+    var childWrap=document.createElement('div');
+    childWrap.style.display='none';
+    var isOpen=false;
+
+    row.addEventListener('click',function(e){
+      e.stopPropagation();
+      if(hasKids){
+        isOpen=!isOpen;
+        childWrap.style.display=isOpen?'block':'none';
+        row.firstChild; // force reflow
+        row.textContent=(isOpen?'[-] ':'[+] ')+inst.name+' ('+inst.cls+')';
+      }
+      // deselect all
+      var prev=document.querySelector('#treeContainer .sel');
+      if(prev){ prev.style.background=''; prev.classList.remove('sel'); }
+      row.style.background='#cdf';
+      row.classList.add('sel');
+      showProps(inst);
+    });
+
+    wrap.appendChild(row);
+    if(hasKids){
+      for(var i=0;i<inst.children.length;i++){
+        var child=INST_MAP[inst.children[i]];
+        if(child) childWrap.appendChild(makeNode(child,depth+1));
+      }
+      wrap.appendChild(childWrap);
+    }
+    return wrap;
+  }
+
+  for(var i=0;i<roots.length;i++) container.appendChild(makeNode(roots[i],0));
+}
+
+// ─── PROPERTIES PANEL ────────────────────────────────────────────────────────
+function showProps(inst) {
+  var c=document.getElementById('propsContainer');
+  var html='<b>'+esc(inst.name)+'</b> ['+esc(inst.cls)+']<br>';
+  html+='RefId: '+inst.id+'<br>';
+  var par=INST_MAP[inst.parentId];
+  if(par) html+='Parent: '+esc(par.name)+' ['+esc(par.cls)+']<br>';
+  html+='Children: '+inst.children.length+'<br>';
+  html+='<hr>';
+  var keys=Object.keys(inst.props);
+  if(!keys.length){ html+='(no properties decoded)'; c.innerHTML=html; return; }
+  html+='<table border="1" cellpadding="2" cellspacing="0" style="border-collapse:collapse;font-size:11px;width:100%;table-layout:fixed">';
+  html+='<colgroup><col width="150"><col></colgroup>';
+  html+='<tr><th align="left">Property</th><th align="left">Value</th></tr>';
+  for(var i=0;i<keys.length;i++){
+    var k=keys[i]; var prop=inst.props[k];
+    html+='<tr><td style="overflow:hidden;word-break:break-word">'+esc(k)+'</td><td style="overflow:hidden;word-break:break-word">'+propHTML(prop,k)+'</td></tr>';
+  }
+  html+='</table>';
+  c.innerHTML=html;
+}
+
+function propHTML(p,k) {
+  if(!p) return '?';
+  switch(p.t){
+    case 'str':
+      if(k==='Source') return '<pre style="max-height:150px;overflow:auto;margin:0;font-size:10px;white-space:pre-wrap">'+esc((p.v||'').substring(0,5000))+((p.v||'').length>5000?'\n...(truncated)':'')+'</pre>';
+      return esc(String(p.v||'').substring(0,200));
+    case 'bool': return p.v?'true':'false';
+    case 'num':  return fn(p.v);
+    case 'col3':
+      var r8=Math.round(p.v.r*255),g8=Math.round(p.v.g*255),b8=Math.round(p.v.b*255);
+      var hex='#'+[r8,g8,b8].map(function(n){return n.toString(16).padStart(2,'0');}).join('');
+      return '<span style="display:inline-block;width:12px;height:12px;background:'+hex+';border:1px solid #666;vertical-align:middle;margin-right:3px"></span>'+r8+', '+g8+', '+b8;
+    case 'v3':   return fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z);
+    case 'v2':   return fn(p.v.x)+', '+fn(p.v.y);
+    case 'cf':   return 'CFrame pos('+fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z)+')';
+    case 'udim2':return 'UDim2('+fn(p.v.xs)+', '+p.v.xo+', '+fn(p.v.ys)+', '+p.v.yo+')';
+    case 'udim': return 'UDim('+fn(p.v.s)+', '+p.v.o+')';
+    case 'enum': return 'Enum value '+p.v;
+    case 'ref':  var t=INST_MAP[p.v]; return t?esc(t.name)+' ['+esc(t.cls)+']':'ref='+p.v;
+    case 'bc':   return 'BrickColor('+p.v+')';
+    case 'font': return esc(p.v);
+    case 'seq':  return '<pre style="margin:0;font-size:10px;white-space:pre-wrap">'+esc(p.v)+'</pre>';
+    case 'id':   return p.v;
+    case 'nil':  return 'nil';
+    case 'axes': return esc(p.v);
+    case 'ray':  return esc(p.v);
+    default:     return esc(String(p.v||'').substring(0,200));
+  }
+}
+
+// ─── CODE GENERATION ─────────────────────────────────────────────────────────
+var SKIP = {Source:1,ScriptGuid:1,AttributesSerialize:1,LinkedSource:1,DefinesCapabilities:1,UniqueId:1,Capabilities:1,SourceAssetId:1};
+
+function setMode(m){ OUT_MODE=m; generateOutput(); }
+
+function generateOutput() {
+  if(!INST_LIST.length) return;
+  var lines=[];
+  var varNames={}, usedNames={};
+
+  function mkVar(inst){
+    if(varNames[inst.id]) return varNames[inst.id];
+    var base=(inst.name||inst.cls).replace(/[^a-zA-Z0-9_]/g,'_').replace(/^(\d)/,'_$1')||'inst';
+    var n=base,c=0; while(usedNames[n]) n=base+'_'+(++c);
+    usedNames[n]=1; varNames[inst.id]=n; return n;
+  }
+
+  var roots=INST_LIST.filter(function(i){return !INST_MAP[i.parentId];});
+
+  lines.push('-- rbxm2SL output');
+  lines.push('-- File: '+FILE_NAME);
+  lines.push('-- Instances: '+INST_LIST.length);
+  lines.push('');
+  if(OUT_MODE==='local'){
+    lines.push('-- LocalScript — drop into StarterPlayerScripts');
+    lines.push('local function Build()');
+  } else if(OUT_MODE==='module'){
+    lines.push('local M = {}');
+    lines.push('function M.Build(parent)');
+  } else {
+    lines.push('-- Script — drop into ServerScriptService');
+    lines.push('local function Build()');
+  }
+
+  function gen(inst, indent) {
+    var pad='  '.repeat(indent+1);
+    var vn=mkVar(inst);
+    var parExpr=INST_MAP[inst.parentId]?mkVar(INST_MAP[inst.parentId]):(OUT_MODE==='module'?'parent':'workspace');
+
+    lines.push(pad+'local '+vn+' = Instance.new("'+inst.cls+'")');
+    if(inst.name!==inst.cls) lines.push(pad+vn+'.Name = '+luaStr(inst.name));
+
+    var keys=Object.keys(inst.props);
+    for(var i=0;i<keys.length;i++){
+      var k=keys[i]; if(k==='Name') continue;
+      if(SKIP[k]){
+        if(k==='Source'&&(inst.cls==='Script'||inst.cls==='LocalScript'||inst.cls==='ModuleScript')){
+          var src=inst.props[k].v||'';
+          lines.push(pad+'-- [Source: '+inst.name+' ('+src.length+' chars)]');
+          if(src.length>0&&src.length<100000){
+            lines.push(pad+vn+'.Source = [==[');
+            lines.push(src);
+            lines.push(pad+']==]');
+          }
+        }
+        continue;
+      }
+      var expr=propToLua(inst.props[k]);
+      if(expr!==null) lines.push(pad+vn+'.'+k+' = '+expr);
+    }
+
+    lines.push(pad+vn+'.Parent = '+parExpr);
+    lines.push('');
+
+    for(var i=0;i<inst.children.length;i++){
+      var child=INST_MAP[inst.children[i]];
+      if(child) gen(child,indent);
+    }
+  }
+
+  for(var i=0;i<roots.length;i++) gen(roots[i],0);
+
+  if(OUT_MODE==='module'){
+    lines.push('  return parent');
+    lines.push('end');
+    lines.push('return M');
+  } else {
+    lines.push('end');
+    lines.push('');
+    lines.push('Build()');
+  }
+  document.getElementById('outputArea').value=lines.join('\n');
+}
+
+function propToLua(p) {
+  if(!p) return null;
+  switch(p.t){
+    case 'str':  return luaStr(String(p.v||''));
+    case 'bool': return p.v?'true':'false';
+    case 'num':  return isFinite(p.v)?fn(p.v):null;
+    case 'col3': return 'Color3.fromRGB('+Math.round(p.v.r*255)+', '+Math.round(p.v.g*255)+', '+Math.round(p.v.b*255)+')';
+    case 'v3':   return 'Vector3.new('+fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z)+')';
+    case 'v2':   return 'Vector2.new('+fn(p.v.x)+', '+fn(p.v.y)+')';
+    case 'udim2':return 'UDim2.new('+fn(p.v.xs)+', '+p.v.xo+', '+fn(p.v.ys)+', '+p.v.yo+')';
+    case 'udim': return 'UDim.new('+fn(p.v.s)+', '+p.v.o+')';
+    case 'cf':   return 'CFrame.new('+fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z)+')';
+    case 'enum': return '-- Enum value '+p.v;
+    case 'bc':   return 'BrickColor.new('+p.v+')';
+    case 'font': return '-- Font: '+p.v;
+    case 'seq':  return '-- '+p.v;
+    default:     return null;
+  }
+}
+
+// ─── Output actions ───────────────────────────────────────────────────────────
+function copyOut(){
+  var ta=document.getElementById('outputArea'); ta.select(); document.execCommand('copy');
+  setStatus('Copied.');
+}
+function downloadOut(){
+  var text=document.getElementById('outputArea').value;
+  var a=document.createElement('a');
+  a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(text);
+  a.download=FILE_NAME+'_'+OUT_MODE+'.lua'; a.click();
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function luaStr(s){
+  s=String(s||'');
+  if(s.indexOf('\n')!==-1||s.indexOf('"')!==-1||s.indexOf('\\')!==-1){
+    return '[==['+s+']==]';
+  }
+  return '"'+s.replace(/\\/g,'\\\\').replace(/"/g,'\\"')+'"';
+}
+
+function fn(n){
+  if(!isFinite(n)) return '0';
+  var r=Math.round(n);
+  if(Math.abs(n-r)<0.000001) return String(r);
+  return parseFloat(n.toFixed(6)).toString();
+}
+</script>
+</body>
+</html>
