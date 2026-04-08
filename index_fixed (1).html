@@ -1,0 +1,951 @@
+ Credits to
+ https://github.com/fiveman1/rbxm-parser-ts
+ For essentially making this project possible in the first place
+
+Created by Axo's Stuff 2026
+Decoding Rbxl and Rbxlx files are still work in progress 
+
+Update: 1.1: Fixed an issue with importing GUIs and certain rbxl and rbxlx files
+
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>rbxm2SL</title>
+</head>
+<body>
+
+<h1>rbxm2SL</h1>
+<p>Decode .rbxm / .rbxmx / .rbxl / .rbxlx files into a runnable Lua script. Handles Parts, MeshParts, GUIs, Lighting, Scripts, everything.</p>
+
+<input type="file" id="fileInput" accept=".rbxm,.rbxmx,.rbxl,.rbxlx">
+<br><br>
+
+<div id="status">Ready.</div>
+<br>
+
+<div id="statsBar" style="display:none">
+  Instances: <b id="statInst">0</b> &nbsp;|&nbsp;
+  Classes: <b id="statCls">0</b> &nbsp;|&nbsp;
+  Scripts: <b id="statScripts">0</b>
+</div>
+
+<br>
+
+<div id="mainArea" style="display:none">
+  <table border="0" width="100%" cellpadding="4">
+    <tr valign="top">
+      <td width="300" style="border-right:1px solid #ccc">
+        <b>Instance Tree</b><br>
+        <div id="treeContainer" style="overflow-y:auto;height:520px;font-family:monospace;font-size:12px;border:1px solid #ccc;padding:2px;"></div>
+      </td>
+      <td>
+        <b>Properties</b><br>
+        <div id="propsContainer" style="overflow-y:auto;height:520px;font-family:monospace;font-size:12px;border:1px solid #ccc;padding:4px;">
+          Click an instance in the tree.
+        </div>
+      </td>
+    </tr>
+  </table>
+</div>
+
+<br>
+
+<div id="outputSection" style="display:none">
+  <b>Output type:</b>
+  <button onclick="setMode('local')">LocalScript</button>
+  <button onclick="setMode('module')">ModuleScript</button>
+  <button onclick="setMode('server')">Script (Server)</button>
+  &nbsp;&nbsp;
+  <button onclick="copyOut()">Copy</button>
+  <button onclick="downloadOut()">Save .lua</button>
+  <br><br>
+  <textarea id="outputArea" rows="30" cols="120" readonly style="font-family:monospace;font-size:12px;"></textarea>
+</div>
+
+<script>
+// ─── globals ────────────────────────────────────────────────────────────────
+var INST_MAP  = {};   // refId (number) -> inst object
+var INST_LIST = [];
+var CLASS_MAP = {};   // classId (number) -> { name, refs[] }
+var OUT_MODE  = 'local';
+var FILE_NAME = 'output';
+
+// ─── file input ─────────────────────────────────────────────────────────────
+document.getElementById('fileInput').addEventListener('change', function() {
+  var f = this.files[0];
+  if (!f) return;
+  FILE_NAME = f.name.replace(/\.[^.]+$/,'');
+  setStatus('Reading ' + f.name + ' (' + fmtSize(f.size) + ')...');
+  var r = new FileReader();
+  r.onload = function(e) {
+    var bytes = new Uint8Array(e.target.result);
+    try {
+      if (isXML(bytes)) {
+        setStatus('XML format. Parsing...');
+        parseXML(new TextDecoder('utf-8',{fatal:false}).decode(bytes));
+      } else if (bytes[0]===0x3c && bytes[1]===0x72 && bytes[7]===0x21) {
+        setStatus('Binary format. Parsing...');
+        parseBinary(bytes);
+      } else {
+        setStatus('ERROR: Not a recognised Roblox file.');
+      }
+    } catch(ex) {
+      setStatus('ERROR: ' + ex.message);
+      console.error(ex);
+    }
+  };
+  r.readAsArrayBuffer(f);
+});
+
+function isXML(b) {
+  // UTF-8 BOM or starts with '<'
+  if (b[0]===0xEF && b[1]===0xBB && b[2]===0xBF) return b[3]===0x3c;
+  return b[0]===0x3c && b[7]!==0x21; // '<' but NOT binary magic second half
+}
+
+function setStatus(s) { document.getElementById('status').textContent = s; }
+function fmtSize(n) {
+  if (n<1024) return n+' B';
+  if (n<1048576) return (n/1024).toFixed(1)+' KB';
+  return (n/1048576).toFixed(1)+' MB';
+}
+
+// ─── LZ4 block decompressor ─────────────────────────────────────────────────
+function lz4dec(src, dstSize) {
+  try {
+    var dst = new Uint8Array(dstSize);
+    var s=0, d=0;
+    while (s < src.length && d < dstSize) {
+      var tok = src[s++];
+      var ll = (tok>>4)&0xf;
+      if (ll===15) { var x; do { x=src[s++]; ll+=x; } while(x===255 && s<src.length); }
+      for (var i=0;i<ll && s<src.length && d<dstSize;i++) dst[d++]=src[s++];
+      if (s>=src.length) break;
+      if (s+1>=src.length) break;
+      var off = src[s]|(src[s+1]<<8); s+=2;
+      if (off===0 || off>d) break;
+      var ml = (tok&0xf)+4;
+      if (ml-4===15) { var x; do { x=src[s++]; ml+=x; } while(x===255 && s<src.length); }
+      var cp = d-off;
+      for (var i=0;i<ml && d<dstSize;i++) { dst[d]=dst[cp]; d++; cp++; }
+    }
+    return dst.subarray(0,d);
+  } catch(ex) {
+    console.warn('LZ4 decompression failed:', ex);
+    return new Uint8Array(dstSize);
+  }
+}
+
+// ─── ZSTD minimal decoder (raw/RLE blocks + literal pass-through) ────────────
+function zstdDec(src, dstSize) {
+  try {
+    var p=0;
+    // frame magic
+    if (p+4>src.length) throw new Error('Invalid zstd: too short');
+    var mag = (src[p]|(src[p+1]<<8)|(src[p+2]<<16)|((src[p+3]&0xff)*0x1000000))>>>0;
+    p+=4;
+    if (mag !== 0xFD2FB528) throw new Error('Not zstd frame');
+    if (p>=src.length) throw new Error('Invalid zstd: truncated header');
+    var fhd=src[p++];
+    var fcsFlag=(fhd>>6)&3, singleSeg=(fhd>>5)&1, didFlag=fhd&3;
+    if (!singleSeg && p<src.length) p++; // window descriptor
+    p += [0,1,2,4][didFlag]; // dict id
+    // frame content size
+    if (fcsFlag===0){ if(singleSeg && p<src.length) p++; }
+    else if(fcsFlag===1) p+=2;
+    else if(fcsFlag===2) p+=4;
+    else p+=8;
+
+    if (p>=src.length) throw new Error('Invalid zstd: no blocks');
+
+    var dst = new Uint8Array(dstSize||4194304);
+    var dPos=0;
+    var maxIter=10000;
+    while(maxIter-->0 && p+3<=src.length) {
+      var bh0=src[p],bh1=src[p+1],bh2=src[p+2]; p+=3;
+      var last=bh0&1, bType=(bh0>>1)&3;
+      var bSize=(bh0>>3)|(bh1<<5)|(bh2<<13);
+      if (p+bSize>src.length) break;
+      if (bType===0) { // raw block
+        for(var i=0;i<bSize && dPos<dst.length;i++) dst[dPos++]=src[p+i]; p+=bSize;
+      } else if (bType===1) { // RLE
+        if (p>=src.length) break;
+        var b=src[p++]; for(var i=0;i<bSize && dPos<dst.length;i++) dst[dPos++]=b;
+      } else if (bType===2) { // compressed
+        var bEnd=p+bSize;
+        var lits=zstdLits(src,p,bEnd); p=lits.np;
+        var ld=lits.data;
+        for(var i=0;i<ld.length && dPos<dst.length;i++) dst[dPos++]=ld[i];
+        p=bEnd;
+      } else break; // reserved
+      if(last) break;
+    }
+    return dst.subarray(0,dPos);
+  } catch(ex) {
+    console.warn('ZSTD decompression failed:', ex);
+    return new Uint8Array(dstSize||0);
+  }
+}
+
+function zstdLits(src, p, bEnd) {
+  try {
+    if (p>=src.length) return {data:new Uint8Array(0), np:p};
+    var litType=src[p]&3, lss=(src[p]>>2)&3;
+    if (litType===0||litType===2) { // raw or RLE
+      var sz;
+      if(lss===0||lss===2){sz=src[p]>>3;p++;}
+      else if(lss===1 && p+1<src.length){sz=(src[p]>>4)|(src[p+1]<<4);p+=2;}
+      else if(p+2<src.length){sz=(src[p]>>4)|(src[p+1]<<4)|(src[p+2]<<12);p+=3;}
+      else return {data:new Uint8Array(0), np:p};
+      if(litType===0){ 
+        var end=Math.min(p+sz, src.length);
+        return {data:src.subarray(p,end), np:end}; 
+      }
+      else{ 
+        if(p>=src.length) return {data:new Uint8Array(0), np:p};
+        var d=new Uint8Array(sz); d.fill(src[p]); return {data:d, np:p+1}; 
+      }
+    } else { // Huffman/treeless — treat compressed literals as raw
+      var sz, cz;
+      if(lss===0 && p+2<src.length){sz=(src[p]>>4)|((src[p+1]&0x3f)<<4);cz=(src[p+1]>>6)|(src[p+2]<<2);p+=3;}
+      else if(lss===1 && p+2<src.length){sz=(src[p]>>4)|(src[p+1]<<4);cz=src[p+2];p+=3;}
+      else if(p+3<src.length){sz=(src[p]>>4)|(src[p+1]<<4)|((src[p+2]&3)<<12);cz=(src[p+2]>>2)|(src[p+3]<<6);p+=4;}
+      else return {data:new Uint8Array(0), np:p};
+      var jump=(litType===3)?sz:cz;
+      var end=Math.min(p+Math.min(sz,bEnd-p), src.length);
+      return {data:src.subarray(p,end), np:Math.min(p+jump, src.length)};
+    }
+  } catch(ex) {
+    return {data:new Uint8Array(0), np:p};
+  }
+}
+
+function decompress(raw, decompLen) {
+  try {
+    if (!raw || !raw.length || raw.length===decompLen) return raw;
+    if (raw.length<4) return raw;
+    var mag=(raw[0]|(raw[1]<<8)|(raw[2]<<16)|((raw[3]&0xff)*0x1000000))>>>0;
+    if (mag===0xFD2FB528) return zstdDec(raw, decompLen);
+    return lz4dec(raw, decompLen);
+  } catch(ex) {
+    console.warn('Decompression failed:', ex);
+    return raw;
+  }
+}
+
+// ─── Read helpers ────────────────────────────────────────────────────────────
+function ru32(b,p){ 
+  if(p+3>=b.length) return 0;
+  return (b[p]|(b[p+1]<<8)|(b[p+2]<<16)|((b[p+3]&0xff)*0x1000000))>>>0; 
+}
+function ri32(b,p){ var v=ru32(b,p); return v>0x7fffffff?v-0x100000000:v; }
+function rf32(b,p){
+  try {
+    if(p+3>=b.length) return 0;
+    var dv=new DataView(new ArrayBuffer(4));
+    dv.setUint8(0,b[p]);dv.setUint8(1,b[p+1]);dv.setUint8(2,b[p+2]);dv.setUint8(3,b[p+3]);
+    return dv.getFloat32(0,true);
+  } catch(ex) { return 0; }
+}
+function rf32be(b,p){ // big-endian float for interleaved
+  try {
+    if(p+3>=b.length) return 0;
+    var dv=new DataView(new ArrayBuffer(4));
+    dv.setUint8(0,b[p]);dv.setUint8(1,b[p+1]);dv.setUint8(2,b[p+2]);dv.setUint8(3,b[p+3]);
+    return dv.getFloat32(0,false);
+  } catch(ex) { return 0; }
+}
+function rf64(b,p){
+  try {
+    if(p+7>=b.length) return 0;
+    var dv=new DataView(new ArrayBuffer(8));
+    for(var i=0;i<8;i++) dv.setUint8(i,b[p+i]);
+    return dv.getFloat64(0,true);
+  } catch(ex) { return 0; }
+}
+function rStr(b,p){
+  try {
+    if(p+4>b.length) return {val:'',end:p};
+    var len=ru32(b,p);
+    if(p+4+len>b.length) return {val:'',end:p+4};
+    return {val:new TextDecoder('utf-8',{fatal:false}).decode(b.subarray(p+4,p+4+len)), end:p+4+len};
+  } catch(ex) { return {val:'',end:p}; }
+}
+
+function rArr(b, count, fn) {
+  var out=[];
+  for(var i=0;i<count;i++){
+    var v=fn(b,i);
+    if(v===undefined||v===null) out.push(0);
+    else out.push(v);
+  }
+  return out;
+}
+
+// delta decoders
+function decDelta32(b) {
+  if(!b||!b.length) return [];
+  var arr=[], acc=0;
+  for(var i=0;i<b.length;i+=4){
+    if(i+3>=b.length) break;
+    var delta=ri32(b,i);
+    acc+=delta;
+    arr.push(acc);
+  }
+  return arr;
+}
+function decDeltaF(b) {
+  if(!b||!b.length) return [];
+  var arr=[], acc=0;
+  for(var i=0;i<b.length;i+=4){
+    if(i+3>=b.length) break;
+    var delta=rf32(b,i);
+    acc+=delta;
+    arr.push(acc);
+  }
+  return arr;
+}
+function decInterF(b) {
+  if(!b||!b.length) return [];
+  var n=b.length/4|0, arr=[];
+  for(var i=0;i<n;i++){
+    if(i*4+3>=b.length) break;
+    arr.push(rf32be(b, i*4));
+  }
+  return arr;
+}
+
+// ─── BINARY PARSER ──────────────────────────────────────────────────────────
+function parseBinary(bytes) {
+  INST_MAP={}; INST_LIST=[]; CLASS_MAP={};
+
+  // Verify magic
+  if (bytes.length<32) throw new Error('File too short');
+  var magic = new TextDecoder().decode(bytes.subarray(0,8));
+  if (magic!=='<roblox!') throw new Error('Invalid binary magic');
+
+  var p=32; // skip header
+  var chunkCount=0, instCount=0, propsCount=0;
+  var sharedStrings=[]; // SSTR chunk
+
+  // Parse chunks
+  while (p+16<=bytes.length && chunkCount<5000) {
+    chunkCount++;
+    var chunkName=new TextDecoder().decode(bytes.subarray(p,p+4));
+    var compLen=ru32(bytes,p+4);
+    var decompLen=ru32(bytes,p+8);
+    p+=16;
+    if (p+compLen>bytes.length) {
+      console.warn('Chunk extends beyond EOF, stopping');
+      break;
+    }
+    var rawData=bytes.subarray(p,p+compLen);
+    p+=compLen;
+
+    try {
+      var data=decompress(rawData,decompLen);
+      if(!data||!data.length) continue;
+
+      if(chunkName==='INST'){
+        var dp=0;
+        if(dp+4>data.length) continue;
+        var classId=ri32(data,dp); dp+=4;
+        var clsName=rStr(data,dp); dp=clsName.end;
+        var isService=(data[dp]===1); dp++;
+        if(dp+4>data.length) continue;
+        var objCnt=ri32(data,dp); dp+=4;
+        if(objCnt<0||objCnt>1000000) continue;
+        var refArr=decDelta32(data.subarray(dp,dp+objCnt*4));
+        instCount+=refArr.length;
+        CLASS_MAP[classId]={name:clsName.val,refs:refArr,isService:isService};
+        for(var i=0;i<refArr.length;i++){
+          var inst={id:refArr[i],cls:clsName.val,name:clsName.val,props:{},children:[],parentId:-1};
+          INST_MAP[refArr[i]]=inst;
+          INST_LIST.push(inst);
+        }
+      }
+      else if(chunkName==='PROP'){
+        var dp=0;
+        if(dp+4>data.length) continue;
+        var classId=ri32(data,dp); dp+=4;
+        var propName=rStr(data,dp); dp=propName.end;
+        if(!CLASS_MAP[classId]) continue;
+        var refs=CLASS_MAP[classId].refs;
+        if(dp>=data.length) continue;
+        var typeCode=data[dp]; dp++;
+
+        try {
+          if(typeCode===0x01){ // string
+            for(var i=0;i<refs.length && dp<data.length;i++){
+              var s=rStr(data,dp); dp=s.end;
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'str',v:s.val};
+            }
+          }
+          else if(typeCode===0x02){ // bool
+            for(var i=0;i<refs.length && dp<data.length;i++){
+              var val=(data[dp]===1); dp++;
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'bool',v:val};
+            }
+          }
+          else if(typeCode===0x03){ // int32
+            var ints=decDelta32(data.subarray(dp,dp+refs.length*4));
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'num',v:ints[i]||0};
+            }
+          }
+          else if(typeCode===0x04){ // float
+            var floats=decDeltaF(data.subarray(dp,dp+refs.length*4));
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'num',v:floats[i]||0};
+            }
+          }
+          else if(typeCode===0x05){ // double
+            var doubles=rArr(data,refs.length,function(b,i){
+              if(i*8+7>=b.length) return 0;
+              return rf64(b,i*8);
+            });
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'num',v:doubles[i]||0};
+            }
+          }
+          else if(typeCode===0x06){ // UDim2
+            var xs=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var xo=decDelta32(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var ys=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var yo=decDelta32(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'udim2',v:{xs:xs[i]||0,xo:xo[i]||0,ys:ys[i]||0,yo:yo[i]||0}};
+            }
+          }
+          else if(typeCode===0x07){ // UDim
+            var s=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var o=decDelta32(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'udim',v:{s:s[i]||0,o:o[i]||0}};
+            }
+          }
+          else if(typeCode===0x08){ // BrickColor (i32)
+            var codes=decDelta32(data.subarray(dp,dp+refs.length*4));
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'bc',v:codes[i]||0};
+            }
+          }
+          else if(typeCode===0x09){ // Color3 (3 floats)
+            var r=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var g=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var b=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'col3',v:{r:r[i]||0,g:g[i]||0,b:b[i]||0}};
+            }
+          }
+          else if(typeCode===0x0a){ // Vector2 (2 floats)
+            var x=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var y=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'v2',v:{x:x[i]||0,y:y[i]||0}};
+            }
+          }
+          else if(typeCode===0x0b){ // Vector3 (3 floats)
+            var x=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var y=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            var z=decInterF(data.subarray(dp,dp+refs.length*4)); dp+=refs.length*4;
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'v3',v:{x:x[i]||0,y:y[i]||0,z:z[i]||0}};
+            }
+          }
+          else if(typeCode===0x10){ // CFrame (pos+rot matrix)
+            if(dp>=data.length) continue;
+            var rotType=data[dp]; dp++;
+            var cfArr=[];
+            for(var i=0;i<refs.length && dp+11<data.length;i++){
+              var px=rf32(data,dp); dp+=4;
+              var py=rf32(data,dp); dp+=4;
+              var pz=rf32(data,dp); dp+=4;
+              cfArr.push({x:px,y:py,z:pz});
+            }
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'cf',v:cfArr[i]||{x:0,y:0,z:0}};
+            }
+          }
+          else if(typeCode===0x12){ // Enum (u32)
+            var codes=decDelta32(data.subarray(dp,dp+refs.length*4));
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'enum',v:codes[i]||0};
+            }
+          }
+          else if(typeCode===0x13){ // Ref (i32)
+            var refIds=decDelta32(data.subarray(dp,dp+refs.length*4));
+            for(var i=0;i<refs.length;i++){
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'ref',v:refIds[i]||0};
+            }
+          }
+          else if(typeCode===0x15){ // SharedString index
+            var indices=decDelta32(data.subarray(dp,dp+refs.length*4));
+            for(var i=0;i<refs.length;i++){
+              var idx=indices[i];
+              var str=(idx>=0&&idx<sharedStrings.length)?sharedStrings[idx]:'';
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'str',v:str};
+            }
+          }
+          else if(typeCode===0x16){ // OptionalCFrame (bool + CFrame)
+            for(var i=0;i<refs.length && dp<data.length;i++){
+              var present=(data[dp]===1); dp++;
+              if(present && dp+11<data.length){
+                var px=rf32(data,dp); dp+=4;
+                var py=rf32(data,dp); dp+=4;
+                var pz=rf32(data,dp); dp+=4;
+                if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'cf',v:{x:px,y:py,z:pz}};
+              } else {
+                if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'nil',v:null};
+              }
+            }
+          }
+          else if(typeCode===0x17){ // UniqueId (16 bytes)
+            for(var i=0;i<refs.length && dp+15<data.length;i++){
+              var bytes16=Array.from(data.subarray(dp,dp+16));
+              dp+=16;
+              var hex=bytes16.map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'id',v:hex};
+            }
+          }
+          else if(typeCode===0x19){ // Font
+            for(var i=0;i<refs.length && dp<data.length;i++){
+              var fam=rStr(data,dp); dp=fam.end;
+              if(dp+2>data.length) break;
+              var weight=ru32(data,dp)&0xffff; dp+=2;
+              if(dp>=data.length) break;
+              var style=data[dp]; dp++;
+              var fontStr=fam.val+' '+weight+' '+style;
+              if(INST_MAP[refs[i]]) INST_MAP[refs[i]].props[propName.val]={t:'font',v:fontStr};
+            }
+          }
+          else {
+            // Unknown type
+          }
+        } catch(pex) {
+          console.warn('Property parse error:', propName.val, pex);
+        }
+        propsCount++;
+      }
+      else if(chunkName==='PRNT'){
+        var dp=0;
+        if(dp>=data.length) continue;
+        var ver=data[dp]; dp++;
+        if(dp+4>data.length) continue;
+        var objCnt=ri32(data,dp); dp+=4;
+        if(objCnt<0||objCnt>1000000) continue;
+        var refs=decDelta32(data.subarray(dp,dp+objCnt*4)); dp+=objCnt*4;
+        var pars=decDelta32(data.subarray(dp,dp+objCnt*4)); dp+=objCnt*4;
+        for(var i=0;i<refs.length;i++){
+          var child=INST_MAP[refs[i]], parent=INST_MAP[pars[i]];
+          if(child){
+            child.parentId=pars[i];
+            if(parent) parent.children.push(refs[i]);
+          }
+        }
+      }
+      else if(chunkName==='META'){
+        // metadata key-value pairs
+      }
+      else if(chunkName==='SSTR'){
+        // SharedStrings
+        var dp=0;
+        if(dp+4>data.length) continue;
+        var ver=ri32(data,dp); dp+=4;
+        if(dp+4>data.length) continue;
+        var cnt=ri32(data,dp); dp+=4;
+        if(cnt<0||cnt>100000) continue;
+        for(var i=0;i<cnt && dp<data.length;i++){
+          var hash=data.subarray(dp,dp+16); dp+=16;
+          var s=rStr(data,dp); dp=s.end;
+          sharedStrings.push(s.val);
+        }
+      }
+      else if(chunkName==='SIGN'){
+        // signatures
+      }
+      else if(chunkName==='END\0'){
+        break;
+      }
+      else {
+        // unknown chunk, skip
+      }
+    } catch(chunkEx) {
+      console.warn('Chunk parse error ('+chunkName+'):', chunkEx);
+    }
+  }
+
+  // Set names from Name property
+  for(var i=0;i<INST_LIST.length;i++){
+    var inst=INST_LIST[i];
+    if(inst.props.Name && inst.props.Name.v) inst.name=inst.props.Name.v;
+  }
+
+  setStatus('Parsed: '+INST_LIST.length+' instances, '+propsCount+' props. Building UI...');
+  buildUI();
+}
+
+// ─── XML PARSER ──────────────────────────────────────────────────────────────
+function parseXML(txt) {
+  INST_MAP={}; INST_LIST=[]; CLASS_MAP={};
+  
+  try {
+    var parser = new DOMParser();
+    var doc = parser.parseFromString(txt, "text/xml");
+    
+    var parseError = doc.querySelector('parsererror');
+    if(parseError) throw new Error('XML parse error');
+
+    var items = doc.querySelectorAll('Item');
+    var maxId=0;
+    for(var i=0;i<items.length;i++){
+      var it=items[i];
+      var cls=it.getAttribute('class')||'Unknown';
+      var refId=parseInt(it.getAttribute('referent')||'0');
+      if(refId>maxId) maxId=refId;
+      var inst={id:refId,cls:cls,name:cls,props:{},children:[],parentId:-1};
+      INST_MAP[refId]=inst;
+      INST_LIST.push(inst);
+
+      var props=it.querySelectorAll(':scope > Properties > *');
+      for(var j=0;j<props.length;j++){
+        var p=props[j];
+        var pName=p.getAttribute('name')||'';
+        var pType=p.tagName.toLowerCase();
+        var pVal=p.textContent||'';
+        
+        if(pType==='string'||pType==='protectedstring'||pType==='binarystring'){
+          inst.props[pName]={t:'str',v:pVal};
+        }
+        else if(pType==='bool'){
+          inst.props[pName]={t:'bool',v:(pVal==='true')};
+        }
+        else if(pType==='int'||pType==='int64'){
+          inst.props[pName]={t:'num',v:parseInt(pVal)||0};
+        }
+        else if(pType==='float'||pType==='double'){
+          inst.props[pName]={t:'num',v:parseFloat(pVal)||0};
+        }
+        else if(pType==='color3'){
+          var rgb=pVal.match(/[\d.]+/g)||['0','0','0'];
+          inst.props[pName]={t:'col3',v:{r:parseFloat(rgb[0])||0,g:parseFloat(rgb[1])||0,b:parseFloat(rgb[2])||0}};
+        }
+        else if(pType==='vector3'){
+          var xyz=pVal.match(/[\d.-]+/g)||['0','0','0'];
+          inst.props[pName]={t:'v3',v:{x:parseFloat(xyz[0])||0,y:parseFloat(xyz[1])||0,z:parseFloat(xyz[2])||0}};
+        }
+        else if(pType==='vector2'){
+          var xy=pVal.match(/[\d.-]+/g)||['0','0'];
+          inst.props[pName]={t:'v2',v:{x:parseFloat(xy[0])||0,y:parseFloat(xy[1])||0}};
+        }
+        else if(pType==='udim2'){
+          var parts=pVal.match(/[\d.-]+/g)||['0','0','0','0'];
+          inst.props[pName]={t:'udim2',v:{xs:parseFloat(parts[0])||0,xo:parseInt(parts[1])||0,ys:parseFloat(parts[2])||0,yo:parseInt(parts[3])||0}};
+        }
+        else if(pType==='coordinateframe'||pType==='cframe'){
+          var nums=pVal.match(/[\d.-]+/g)||['0','0','0'];
+          inst.props[pName]={t:'cf',v:{x:parseFloat(nums[0])||0,y:parseFloat(nums[1])||0,z:parseFloat(nums[2])||0}};
+        }
+        else if(pType==='ref'){
+          inst.props[pName]={t:'ref',v:parseInt(pVal)||0};
+        }
+        else {
+          inst.props[pName]={t:'str',v:pVal};
+        }
+      }
+      
+      if(inst.props.Name) inst.name=inst.props.Name.v;
+    }
+
+    // Build parent-child relationships
+    for(var i=0;i<items.length;i++){
+      var it=items[i];
+      var refId=parseInt(it.getAttribute('referent')||'0');
+      var inst=INST_MAP[refId];
+      if(!inst) continue;
+      
+      var parentItem=it.parentElement;
+      while(parentItem && parentItem.tagName!=='Item' && parentItem.tagName!=='roblox'){
+        parentItem=parentItem.parentElement;
+      }
+      if(parentItem && parentItem.tagName==='Item'){
+        var parId=parseInt(parentItem.getAttribute('referent')||'0');
+        inst.parentId=parId;
+        if(INST_MAP[parId]) INST_MAP[parId].children.push(refId);
+      }
+    }
+
+    setStatus('Parsed: '+INST_LIST.length+' instances (XML). Building UI...');
+    buildUI();
+  } catch(ex) {
+    throw new Error('XML parsing failed: '+ex.message);
+  }
+}
+
+// ─── UI BUILDER ──────────────────────────────────────────────────────────────
+function buildUI() {
+  document.getElementById('mainArea').style.display='block';
+  document.getElementById('outputSection').style.display='block';
+
+  var uniqueClasses={};
+  var scriptCount=0;
+  for(var i=0;i<INST_LIST.length;i++){
+    uniqueClasses[INST_LIST[i].cls]=1;
+    if(INST_LIST[i].cls==='Script'||INST_LIST[i].cls==='LocalScript'||INST_LIST[i].cls==='ModuleScript') scriptCount++;
+  }
+  document.getElementById('statInst').textContent=INST_LIST.length;
+  document.getElementById('statCls').textContent=Object.keys(uniqueClasses).length;
+  document.getElementById('statScripts').textContent=scriptCount;
+  document.getElementById('statsBar').style.display='block';
+
+  buildTree();
+  generateOutput();
+  setStatus('Ready. '+INST_LIST.length+' instances loaded.');
+}
+
+function buildTree() {
+  var container=document.getElementById('treeContainer');
+  container.innerHTML='';
+  
+  var roots=INST_LIST.filter(function(i){return !INST_MAP[i.parentId];});
+
+  function makeNode(inst, depth) {
+    var hasKids=inst.children.length>0;
+    var wrap=document.createElement('div');
+    var row=document.createElement('div');
+    row.style.paddingLeft=(depth*14)+'px';
+    row.style.cursor='pointer';
+    row.style.userSelect='none';
+    row.textContent=(hasKids?'[+] ':'    ')+inst.name+' ('+inst.cls+')';
+
+    var childWrap=document.createElement('div');
+    childWrap.style.display='none';
+
+    row.addEventListener('click',function(e){
+      e.stopPropagation();
+      if(hasKids){
+        var isOpen=(childWrap.style.display!=='none');
+        childWrap.style.display=isOpen?'none':'block';
+        row.textContent=(isOpen?'[+] ':'[-] ')+inst.name+' ('+inst.cls+')';
+      }
+      // deselect all
+      var prev=document.querySelector('#treeContainer .sel');
+      if(prev){ prev.style.background=''; prev.classList.remove('sel'); }
+      row.style.background='#cdf';
+      row.classList.add('sel');
+      showProps(inst);
+    });
+
+    wrap.appendChild(row);
+    if(hasKids){
+      for(var i=0;i<inst.children.length;i++){
+        var child=INST_MAP[inst.children[i]];
+        if(child) childWrap.appendChild(makeNode(child,depth+1));
+      }
+      wrap.appendChild(childWrap);
+    }
+    return wrap;
+  }
+
+  for(var i=0;i<roots.length;i++) container.appendChild(makeNode(roots[i],0));
+}
+
+// ─── PROPERTIES PANEL ────────────────────────────────────────────────────────
+function showProps(inst) {
+  var c=document.getElementById('propsContainer');
+  var html='<b>'+esc(inst.name)+'</b> ['+esc(inst.cls)+']<br>';
+  html+='RefId: '+inst.id+'<br>';
+  var par=INST_MAP[inst.parentId];
+  if(par) html+='Parent: '+esc(par.name)+' ['+esc(par.cls)+']<br>';
+  html+='Children: '+inst.children.length+'<br>';
+  html+='<hr>';
+  var keys=Object.keys(inst.props);
+  if(!keys.length){ html+='(no properties decoded)'; c.innerHTML=html; return; }
+  html+='<table border="1" cellpadding="2" cellspacing="0" style="border-collapse:collapse;font-size:11px;width:100%;table-layout:fixed">';
+  html+='<colgroup><col width="150"><col></colgroup>';
+  html+='<tr><th align="left">Property</th><th align="left">Value</th></tr>';
+  for(var i=0;i<keys.length;i++){
+    var k=keys[i]; var prop=inst.props[k];
+    html+='<tr><td style="overflow:hidden;word-break:break-word">'+esc(k)+'</td><td style="overflow:hidden;word-break:break-word">'+propHTML(prop,k)+'</td></tr>';
+  }
+  html+='</table>';
+  c.innerHTML=html;
+}
+
+function propHTML(p,k) {
+  if(!p) return '?';
+  try {
+    switch(p.t){
+      case 'str':
+        if(k==='Source') return '<pre style="max-height:150px;overflow:auto;margin:0;font-size:10px;white-space:pre-wrap">'+esc((p.v||'').substring(0,5000))+((p.v||'').length>5000?'\n...(truncated)':'')+'</pre>';
+        return esc(String(p.v||'').substring(0,200));
+      case 'bool': return p.v?'true':'false';
+      case 'num':  return fn(p.v);
+      case 'col3':
+        var r8=Math.round((p.v.r||0)*255),g8=Math.round((p.v.g||0)*255),b8=Math.round((p.v.b||0)*255);
+        var hex='#'+[r8,g8,b8].map(function(n){return n.toString(16).padStart(2,'0');}).join('');
+        return '<span style="display:inline-block;width:12px;height:12px;background:'+hex+';border:1px solid #666;vertical-align:middle;margin-right:3px"></span>'+r8+', '+g8+', '+b8;
+      case 'v3':   return fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z);
+      case 'v2':   return fn(p.v.x)+', '+fn(p.v.y);
+      case 'cf':   return 'CFrame pos('+fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z)+')';
+      case 'udim2':return 'UDim2('+fn(p.v.xs)+', '+p.v.xo+', '+fn(p.v.ys)+', '+p.v.yo+')';
+      case 'udim': return 'UDim('+fn(p.v.s)+', '+p.v.o+')';
+      case 'enum': return 'Enum value '+p.v;
+      case 'ref':  var t=INST_MAP[p.v]; return t?esc(t.name)+' ['+esc(t.cls)+']':'ref='+p.v;
+      case 'bc':   return 'BrickColor('+p.v+')';
+      case 'font': return esc(p.v);
+      case 'seq':  return '<pre style="margin:0;font-size:10px;white-space:pre-wrap">'+esc(p.v)+'</pre>';
+      case 'id':   return p.v;
+      case 'nil':  return 'nil';
+      case 'axes': return esc(p.v);
+      case 'ray':  return esc(p.v);
+      default:     return esc(String(p.v||'').substring(0,200));
+    }
+  } catch(ex) {
+    return '(error)';
+  }
+}
+
+// ─── CODE GENERATION ─────────────────────────────────────────────────────────
+var SKIP = {Source:1,ScriptGuid:1,AttributesSerialize:1,LinkedSource:1,DefinesCapabilities:1,UniqueId:1,Capabilities:1,SourceAssetId:1};
+
+function setMode(m){ OUT_MODE=m; generateOutput(); }
+
+function generateOutput() {
+  if(!INST_LIST.length) return;
+  var lines=[];
+  var varNames={}, usedNames={};
+
+  function mkVar(inst){
+    if(varNames[inst.id]) return varNames[inst.id];
+    var base=(inst.name||inst.cls).replace(/[^a-zA-Z0-9_]/g,'_').replace(/^(\d)/,'_$1')||'inst';
+    var n=base,c=0; while(usedNames[n]) n=base+'_'+(++c);
+    usedNames[n]=1; varNames[inst.id]=n; return n;
+  }
+
+  var roots=INST_LIST.filter(function(i){return !INST_MAP[i.parentId];});
+
+  lines.push('-- rbxm2SL output');
+  lines.push('-- File: '+FILE_NAME);
+  lines.push('-- Instances: '+INST_LIST.length);
+  lines.push('');
+  if(OUT_MODE==='local'){
+    lines.push('-- LocalScript — drop into StarterPlayerScripts');
+    lines.push('local function Build()');
+  } else if(OUT_MODE==='module'){
+    lines.push('local M = {}');
+    lines.push('function M.Build(parent)');
+  } else {
+    lines.push('-- Script — drop into ServerScriptService');
+    lines.push('local function Build()');
+  }
+
+  function gen(inst, indent) {
+    var pad='  '.repeat(indent+1);
+    var vn=mkVar(inst);
+    var parExpr=INST_MAP[inst.parentId]?mkVar(INST_MAP[inst.parentId]):(OUT_MODE==='module'?'parent':'workspace');
+
+    lines.push(pad+'local '+vn+' = Instance.new("'+inst.cls+'")');
+    if(inst.name!==inst.cls) lines.push(pad+vn+'.Name = '+luaStr(inst.name));
+
+    var keys=Object.keys(inst.props);
+    for(var i=0;i<keys.length;i++){
+      var k=keys[i]; if(k==='Name') continue;
+      if(SKIP[k]){
+        if(k==='Source'&&(inst.cls==='Script'||inst.cls==='LocalScript'||inst.cls==='ModuleScript')){
+          var src=inst.props[k].v||'';
+          lines.push(pad+'-- [Source: '+inst.name+' ('+src.length+' chars)]');
+          if(src.length>0&&src.length<100000){
+            lines.push(pad+vn+'.Source = [==[');
+            lines.push(src);
+            lines.push(pad+']==]');
+          }
+        }
+        continue;
+      }
+      var expr=propToLua(inst.props[k]);
+      if(expr!==null) lines.push(pad+vn+'.'+k+' = '+expr);
+    }
+
+    lines.push(pad+vn+'.Parent = '+parExpr);
+    lines.push('');
+
+    for(var i=0;i<inst.children.length;i++){
+      var child=INST_MAP[inst.children[i]];
+      if(child) gen(child,indent);
+    }
+  }
+
+  for(var i=0;i<roots.length;i++) gen(roots[i],0);
+
+  if(OUT_MODE==='module'){
+    lines.push('  return parent');
+    lines.push('end');
+    lines.push('return M');
+  } else {
+    lines.push('end');
+    lines.push('');
+    lines.push('Build()');
+  }
+  document.getElementById('outputArea').value=lines.join('\n');
+}
+
+function propToLua(p) {
+  if(!p) return null;
+  try {
+    switch(p.t){
+      case 'str':  return luaStr(String(p.v||''));
+      case 'bool': return p.v?'true':'false';
+      case 'num':  return isFinite(p.v)?fn(p.v):null;
+      case 'col3': return 'Color3.fromRGB('+Math.round((p.v.r||0)*255)+', '+Math.round((p.v.g||0)*255)+', '+Math.round((p.v.b||0)*255)+')';
+      case 'v3':   return 'Vector3.new('+fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z)+')';
+      case 'v2':   return 'Vector2.new('+fn(p.v.x)+', '+fn(p.v.y)+')';
+      case 'udim2':return 'UDim2.new('+fn(p.v.xs)+', '+p.v.xo+', '+fn(p.v.ys)+', '+p.v.yo+')';
+      case 'udim': return 'UDim.new('+fn(p.v.s)+', '+p.v.o+')';
+      case 'cf':   return 'CFrame.new('+fn(p.v.x)+', '+fn(p.v.y)+', '+fn(p.v.z)+')';
+      case 'enum': return '-- Enum value '+p.v;
+      case 'bc':   return 'BrickColor.new('+p.v+')';
+      case 'font': return '-- Font: '+p.v;
+      case 'seq':  return '-- '+p.v;
+      default:     return null;
+    }
+  } catch(ex) {
+    return null;
+  }
+}
+
+// ─── Output actions ───────────────────────────────────────────────────────────
+function copyOut(){
+  var ta=document.getElementById('outputArea'); ta.select(); document.execCommand('copy');
+  setStatus('Copied.');
+}
+function downloadOut(){
+  var text=document.getElementById('outputArea').value;
+  var a=document.createElement('a');
+  a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(text);
+  a.download=FILE_NAME+'_'+OUT_MODE+'.lua'; a.click();
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function luaStr(s){
+  s=String(s||'');
+  if(s.indexOf('\n')!==-1||s.indexOf('"')!==-1||s.indexOf('\\')!==-1){
+    return '[==['+s+']==]';
+  }
+  return '"'+s.replace(/\\/g,'\\\\').replace(/"/g,'\\"')+'"';
+}
+
+function fn(n){
+  if(!isFinite(n)) return '0';
+  var r=Math.round(n);
+  if(Math.abs(n-r)<0.000001) return String(r);
+  return parseFloat(n.toFixed(6)).toString();
+}
+</script>
+</body>
+</html>
+
+if you're wondering why this site essentially has no CSS Styling its because this was originally localhosted on my old phone and i didn't care on making it look good
