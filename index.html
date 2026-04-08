@@ -603,7 +603,8 @@ function parseXML(txt) {
       var it=items[i];
       var cls=it.getAttribute('class')||'Unknown';
       var refId=parseInt(it.getAttribute('referent')||'0');
-      if(refId>maxId) maxId=refId;
+       if(refId>maxId) maxId=refId;
+
       var inst={id:refId,cls:cls,name:cls,props:{},children:[],parentId:-1};
       INST_MAP[refId]=inst;
       INST_LIST.push(inst);
@@ -814,81 +815,64 @@ function setMode(m){ OUT_MODE=m; generateOutput(); }
 
 function generateOutput() {
   if(!INST_LIST.length) return;
-  var lines=[];
-  var varNames={}, usedNames={};
+  var lines = [];
+  var varNames = {}, usedNames = {};
 
   function mkVar(inst){
     if(varNames[inst.id]) return varNames[inst.id];
-    var base=(inst.name||inst.cls).replace(/[^a-zA-Z0-9_]/g,'_').replace(/^(\d)/,'_$1')||'inst';
-    var n=base,c=0; while(usedNames[n]) n=base+'_'+(++c);
-    usedNames[n]=1; varNames[inst.id]=n; return n;
+    var base = (inst.name || inst.cls).replace(/[^a-zA-Z0-9_]/g, '_').replace(/^(\d)/, '_$1') || 'inst';
+    var n = base, c = 0; while(usedNames[n]) n = base + '_' + (++c);
+    usedNames[n] = 1; varNames[inst.id] = n; return n;
   }
 
-  var roots=INST_LIST.filter(function(i){return !INST_MAP[i.parentId];});
+  var roots = INST_LIST.filter(function(i){ return !INST_MAP[i.parentId]; });
 
-  lines.push('-- rbxm2SL output');
-  lines.push('-- File: '+FILE_NAME);
-  lines.push('-- Instances: '+INST_LIST.length);
-  lines.push('');
-  if(OUT_MODE==='local'){
-    lines.push('-- LocalScript — drop into StarterPlayerScripts');
-    lines.push('local function Build()');
-  } else if(OUT_MODE==='module'){
-    lines.push('local M = {}');
-    lines.push('function M.Build(parent)');
+  lines.push('-- rbxm2SL fixed output');
+  if(OUT_MODE === 'module'){
+    lines.push('local M = {}\nfunction M.Build(parent)');
   } else {
-    lines.push('-- Script — drop into ServerScriptService');
     lines.push('local function Build()');
   }
 
-  function gen(inst, indent) {
-    var pad='  '.repeat(indent+1);
-    var vn=mkVar(inst);
-    var parExpr=INST_MAP[inst.parentId]?mkVar(INST_MAP[inst.parentId]):(OUT_MODE==='module'?'parent':'workspace');
-
-    lines.push(pad+'local '+vn+' = Instance.new("'+inst.cls+'")');
-    if(inst.name!==inst.cls) lines.push(pad+vn+'.Name = '+luaStr(inst.name));
-
-    var keys=Object.keys(inst.props);
-    for(var i=0;i<keys.length;i++){
-      var k=keys[i]; if(k==='Name') continue;
-      if(SKIP[k]){
-        if(k==='Source'&&(inst.cls==='Script'||inst.cls==='LocalScript'||inst.cls==='ModuleScript')){
-          var src=inst.props[k].v||'';
-          lines.push(pad+'-- [Source: '+inst.name+' ('+src.length+' chars)]');
-          if(src.length>0&&src.length<100000){
-            lines.push(pad+vn+'.Source = [==[');
-            lines.push(src);
-            lines.push(pad+']==]');
-          }
-        }
-        continue;
-      }
-      var expr=propToLua(inst.props[k]);
-      if(expr!==null) lines.push(pad+vn+'.'+k+' = '+expr);
-    }
-
-    lines.push(pad+vn+'.Parent = '+parExpr);
-    lines.push('');
-
-    for(var i=0;i<inst.children.length;i++){
-      var child=INST_MAP[inst.children[i]];
-      if(child) gen(child,indent);
+  function pass1(inst, indent) {
+    var pad = '  '.repeat(indent + 1);
+    var vn = mkVar(inst);
+    var parExpr = INST_MAP[inst.parentId] ? mkVar(INST_MAP[inst.parentId]) : (OUT_MODE === 'module' ? 'parent' : 'workspace');
+    lines.push(pad + 'local ' + vn + ' = Instance.new("' + inst.cls + '")');
+    lines.push(pad + vn + '.Name = ' + luaStr(inst.name));
+    lines.push(pad + vn + '.Parent = ' + parExpr);
+    for(var i=0; i<inst.children.length; i++){
+      var child = INST_MAP[inst.children[i]];
+      if(child) pass1(child, indent);
     }
   }
 
-  for(var i=0;i<roots.length;i++) gen(roots[i],0);
+  function pass2(inst, indent) {
+    var pad = '  '.repeat(indent + 1);
+    var vn = varNames[inst.id];
+    var keys = Object.keys(inst.props);
+    for(var i=0; i<keys.length; i++){
+      var k = keys[i];
+      if(k === 'Name' || SKIP[k]) continue;
+      var expr = propToLua(inst.props[k]);
+      if(expr !== null) lines.push(pad + vn + '.' + k + ' = ' + expr);
+    }
+    for(var i=0; i<inst.children.length; i++){
+      var child = INST_MAP[inst.children[i]];
+      if(child) pass2(child, indent);
+    }
+  }
 
-  if(OUT_MODE==='module'){
-    lines.push('  return parent');
-    lines.push('end');
-    lines.push('return M');
+  for(var i=0; i<roots.length; i++) pass1(roots[i], 0);
+  lines.push('\n  -- Applying Properties --');
+  for(var i=0; i<roots.length; i++) pass2(roots[i], 0);
+
+  if(OUT_MODE === 'module'){
+    lines.push('  return parent\nend\nreturn M');
   } else {
-    lines.push('end');
-    lines.push('');
-    lines.push('Build()');
+    lines.push('end\nBuild()');
   }
-  document.getElementById('outputArea').value=lines.join('\n');
+  document.getElementById('outputArea').value = lines.join('\n');
 }
 
 function propToLua(p) {
@@ -930,12 +914,14 @@ function downloadOut(){
 // ─── Utilities ────────────────────────────────────────────────────────────────
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-function luaStr(s){
-  s=String(s||'');
-  if(s.indexOf('\n')!==-1||s.indexOf('"')!==-1||s.indexOf('\\')!==-1){
-    return '[==['+s+']==]';
+function luaStr(s) {
+  s = String(s || '');
+  if (s.indexOf('\n') !== -1 || s.indexOf('"') !== -1 || s.indexOf('\\') !== -1) {
+    var eq = "==";
+    while (s.indexOf(']' + eq + ']') !== -1) { eq += "="; }
+    return '[' + eq + '[' + s + ']' + eq + ']';
   }
-  return '"'+s.replace(/\\/g,'\\\\').replace(/"/g,'\\"')+'"';
+  return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
 }
 
 function fn(n){
